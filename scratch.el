@@ -4,24 +4,24 @@
     (copy-file "glmakie_el.so" tmp t)
     (module-load tmp)))
 
-(glmakie-reload)
+(progn
+  (glmakie-reload)
+  (glmakie-init "/dev/shm/glmakie_emacs.bin")
 
+  )
 
-(glmakie-init "/dev/shm/glmakie_emacs.bin")
-
-(setq glmakie-buffer (make-vector (* 3 2) 0.0))
-
-(glmakie-read glmakie-buffer)
-glmakie-buffer
-
-(append glmakie-buffer nil)
-(aref glmakie-buffer 1)
-
-
+;; The image specification object uniquely (with respect to ‘eq’) identifies a
+;; canvas image object.
 (setq glmakie-canvas
       `(image :type canvas
-              :id glmakie
-              :data-width 3
-              :data-height 2))
+              :id glmakie2
+              :data-width 712
+              :data-height 423))
 
-(insert (propertize "#" 'display glmakie-canvas))
+(progn
+  (glmakie-update glmakie-canvas)
+  (canvas-refresh glmakie-canvas)
+  )
+
+(insert "\n" (propertize "#" 'display glmakie-canvas))
+#

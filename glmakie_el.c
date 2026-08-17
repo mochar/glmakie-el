@@ -8,8 +8,8 @@
 
 int plugin_is_GPL_compatible;
 
-static float* shared_buffer = MAP_FAILED;
-#define BUFFER_COUNT 3 * 2
+static uint32_t* shared_buffer = MAP_FAILED;
+#define BUFFER_COUNT 712*423
 #define BUFFER_SIZE 4 * BUFFER_COUNT
 
 char* alloc_emacs_string(emacs_env* env, emacs_value emacs_str) {
@@ -87,10 +87,25 @@ static emacs_value Fread(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
   ptrdiff_t limit = (vec_len < BUFFER_COUNT) ? vec_len : BUFFER_COUNT;
 
   for (ptrdiff_t i = 0; i < limit; i++) {
-    emacs_value val = env->make_float(env, shared_buffer[i]);
+    emacs_value val = env->make_integer(env, shared_buffer[i]);
     env->vec_set(env, vec, i, val);
   }
 
+  return env->intern(env, "t");
+}
+
+/* Lisp: (glmakie-update CANVAS) */
+static emacs_value Fupdate(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
+  if (shared_buffer == MAP_FAILED) {
+    message(env, "Buffer unintialized");
+    return env->intern(env, "nil");
+  }
+
+  uint32_t *canvas_buffer = env->canvas_data(env, args[0]);
+
+  if (canvas_buffer) {
+    memcpy(canvas_buffer, shared_buffer, BUFFER_SIZE);
+  }
   return env->intern(env, "t");
 }
 
@@ -104,6 +119,10 @@ int emacs_module_init(struct emacs_runtime* rt) {
   emacs_value read_fun =
       env->make_function(env, 1, 1, Fread, "Read data and place in vector.", NULL);
   bind_function(env, "glmakie-read", read_fun);
+  
+  emacs_value update_fun =
+      env->make_function(env, 1, 1, Fupdate, "Update CANVAS", NULL);
+  bind_function(env, "glmakie-update", update_fun);
 
   return 0;
 }

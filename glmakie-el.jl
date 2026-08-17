@@ -1,15 +1,20 @@
-using Mmap
+using Mmap, GLMakie, Makie, Colors
+using FixedPointNumbers: N0f8
 
-const WIDTH = 3
-const HEIGHT = 2
 const SHM_PATH = "/dev/shm/glmakie_emacs.bin"
+
+f = Figure()
+lines(f[1,1], sin.(1:100))
+screen = f.scene.current_screens[1]
+framebuf = screen.framebuffer.buffers[:color]
+WIDTH, HEIGHT = size(framebuf)
 
 io = open(SHM_PATH, "w+")
 truncate(io, WIDTH * HEIGHT * 4) # 4 bytes per pixel (RGBA)
 
-shared = mmap(io, Matrix{Float32}, (WIDTH, HEIGHT))
+shared = mmap(io, Matrix{RGBA{N0f8}}, (HEIGHT, WIDTH))
 
 
-data = randn(WIDTH, HEIGHT)
-copyto!(shared, data)
+cpu_buffer = colorbuffer(screen)
+copyto!(shared, cpu_buffer')
 Mmap.sync!(shared)
