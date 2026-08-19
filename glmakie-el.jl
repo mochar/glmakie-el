@@ -1,4 +1,4 @@
-using Mmap, GLMakie, Makie, Colors, Match
+using Mmap, GLMakie, Makie, Colors, Match, Logging
 using FixedPointNumbers: N0f8
 
 
@@ -183,87 +183,124 @@ end
 
 using Sockets, Base.Threads
 
-server = listen(8888)
+port = 8888
+server::Sockets.TCPServer = listen(port)
+server_task::Union{Nothing, Task} = nothing
+server_stop_flag = Threads.Atomic{Bool}(false)
 conns = TCPSocket[]
 canvases = Dict{Tuple{TCPSocket, String}, EmacsCanvas}()
 
-server_task = @async begin
-    while true
-        conn = accept(server)
-        push!(conns, conn)
+function start_server()
+    global server, server_stop_flag, server_task
+    
+    server_stop_flag[] = false
+    if !isopen(server)
+        server = listen(port)
+    end
+    server_task = @async begin
+        while !server_stop_flag[]
+            conn = accept(server)
+            push!(conns, conn)
         
-        @async begin
-            try
-                while isopen(conn)
-                    line = readline(conn)
+            @async begin
+                try
+                    while isopen(conn)
+                        line = readline(conn)
 
-                    if isempty(line)
-                        println("Connection killed")
-                        break
-                    end
-
-                    println("Got $line")
-                    
-                    parts = split(line)
-                    if parts[1] == "INIT"
-                        id = String(parts[2])
-                        h = parse(Int, parts[3])
-                        w = parse(Int, parts[4])
-                        
-                        canvas = init_canvas(id, h, w)
-
-                        if haskey(canvases, (conn, id))
-                            close!(pop!(canvases, (conn, id)))
-                        end
-                        canvases[(conn, id)] = canvas
-                        
-                        println(conn, "INIT $id $h $w")
-                    elseif parts[1] == "RESIZE"
-                        id = String(parts[2])
-                        h = parse(Int, parts[3])
-                        w = parse(Int, parts[4])
-                        
-                        canvas = canvases[(conn, id)]
-                        resize!(canvas, h, w)
-                        
-                        println(conn, "RESIZE $id $h $w") 
-                    elseif parts[1] == "MOUSE"
-                        id = String(parts[4])
-                        x = parse(Float32, parts[5])
-                        y = parse(Float32, parts[6])
-                        
-                        canvas = canvases[(conn, id)]
-                        events = canvas.screen.scene.events
-
-                        events.mouseposition[] = (x, y)
-                        
-                        if parts[3] == "DRAG"
-                        else
-                            btn = parts[2] == "LEFT" ? Makie.Mouse.left : Makie.Mouse.right
-                            action = parts[3] == "PRESS" ? Makie.Mouse.press : Makie.Mouse.release
-                            events.mousebutton[] = Makie.MouseButtonEvent(btn, action)
+                        if isempty(line)
+                            @info "Connection killed"
+                            break
                         end
 
-                        GLMakie.render_frame(canvas.screen)
-                        sync!(canvas)
-                        println(conn, "REFRESH $id") 
-                    elseif parts[1] == "CLOSE"
-                        id = String(parts[2])
-                        close!(pop!(canvases, (c, id)))
+                        @info "Message: $line"
+                        Base.invokelatest(process_message, conn, line)
                     end
-                end
-            catch e
-                println("Connection error: ", e)
-            finally
-                for (c, id) in keys(canvases)
-                    if c == conn
-                        close!(pop!(canvases, (c, id)))
+                catch e
+                    @error e
+                finally
+                    close(conn)
+                    for (c, id) in keys(canvases)
+                        if c == conn
+                            close!(pop!(canvases, (c, id)))
+                        end
                     end
+                    deleteat!(conns, findall(x->x==conn, conns))
                 end
-                deleteat!(conns, findall(x->x==conn, conns))
             end
         end
     end
 end
 
-errormonitor(server_task)
+function stop_server()
+    server_stop_flag[] = true
+    
+    # Interrupt the blocking accept() call
+    if isopen(server)
+        close(server)
+    end
+    
+    # Clean up any active client connections
+    for conn in conns
+        if isopen(conn)
+            close(conn)
+        end
+    end
+    empty!(conns)
+    
+    @info "Server stopped and connections cleared"
+end
+
+function process_message(conn::TCPSocket, message::AbstractString)
+    parts = split(message)
+    @match parts begin
+        ["INIT", id, h, w] => process_init(conn, id, h, w)
+        ["RESIZE", id, h, w] => process_resize(conn, id, h, w)
+        ["MOUSE", btn, action, id, x, y] => process_mouse(conn, btn, action, id, x, y)
+        ["CLOSE", id] => close!(pop!(canvases, (conn, String(id))))
+    end
+end
+
+function process_init(conn, id, h, w)
+    id = String(id)
+    h, w = parse.(Int, [h, w])
+    
+    canvas = init_canvas(id, h, w)
+    if haskey(canvases, (conn, id))
+        close!(pop!(canvases, (conn, id)))
+    end
+    canvases[(conn, id)] = canvas
+    println(conn, "INIT $id $h $w")
+end
+
+function process_resize(conn, id, h, w)
+    id = String(id)
+    h, w = parse.(Int, [h, w])
+    
+    canvas = canvases[(conn, id)]
+    resize!(canvas, h, w)
+    println(conn, "RESIZE $id $h $w") 
+end
+
+function process_mouse(conn, btn, action, id, x, y)
+    id = String(id)
+    canvas = canvases[(conn, id)]
+    window = canvas.screen.glscreen
+    
+    x, y = parse.(Float32, [x, y])
+    y = window.height - y
+
+    events = canvas.screen.scene.events
+    events.mouseposition[] = (x, y)
+                        
+    if action != "DRAG"
+        btn = btn == "LEFT" ? Makie.Mouse.left : Makie.Mouse.right
+        action = action == "PRESS" ? Makie.Mouse.press : Makie.Mouse.release
+        events.mousebutton[] = Makie.MouseButtonEvent(btn, action)
+    end
+
+    GLMakie.render_frame(canvas.screen)
+    sync!(canvas)
+    println(conn, "REFRESH $id") 
+end
+
+errormonitor(start_server())

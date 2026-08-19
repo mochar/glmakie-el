@@ -32,34 +32,72 @@
 
 ;;;; Module
 
-(defun glmakie-reload ()
+(defun glmakie--reload-module ()
   (let ((tmp (make-temp-file "glmakie_el_" nil ".so")))
     (copy-file "glmakie_el.so" tmp t)
     (module-load tmp)))
 
-;;;; Server
+;;;; Variables
 
+;; Key is string id, but id in canvas is symbol!
+(defvar glmakie--id->figure (make-hash-table :test #'equal))
+
+;; Server process
 (defvar glmakie--process nil)
 (defvar glmakie--process-buf-name "*glmakie process*")
 
+
+;;;; Utilities
+
+(defun glmakie--server-live-p ()
+  (when-let ((process-buf (get-buffer glmakie--process-buf-name)))
+    (and process-buf
+         (buffer-live-p process-buf)
+         (process-live-p glmakie--process))))
+
+(defun glmakie--cleanup ()
+  (glmakie--munmap)
+  (unless (hash-table-empty-p glmakie--id->figure)
+    ;; TODO  Clean up buf per fig once thats implemented
+    ;; (maphash
+    ;;  (lambda (id fig)
+       
+    ;;    )
+    ;;  glmakie--id->figure
+    ;;  )
+    (clrhash glmakie--id->figure)))
+
+;;;; Server
+
 (defun glmakie-connect ()
-  (let ((process-buf (get-buffer glmakie--process-buf-name)))
-    (unless (and process-buf (buffer-live-p process-buf) (process-live-p glmakie--process))
-      (setq process-buf (get-buffer-create glmakie--process-buf-name))
-      (setq glmakie--process
-            (open-network-stream
-             "glmakie-process"
-             process-buf
-             "localhost"
-             8888))
-      (set-process-filter glmakie--process #'glmakie--server-process-filter))))
+  (if (glmakie--server-live-p)
+      (message "Already connected")
+    (setq glmakie--process
+          (open-network-stream
+           "glmakie-process"
+           (get-buffer-create glmakie--process-buf-name)
+           "localhost"
+           8888))
+    (set-process-filter glmakie--process #'glmakie--server-process-filter)
+    (set-process-sentinel glmakie--process #'glmakie--server-process-sentinel)))
 
 (defun glmakie-disconnect ()
+  (glmakie--cleanup)
   (when (process-live-p glmakie--process)
     (delete-process glmakie--process))
   (when-let ((process-buf (get-buffer glmakie--process-buf-name)))
     (when (buffer-live-p process-buf)
       (kill-buffer process-buf))))
+
+(defun glmakie--server-process-sentinel (proc event)
+  (pcase (s-trim event)
+    ("connection broken by remote peer"
+     (glmakie-disconnect)
+     (message "GLMakie: Disconnected"))
+    ("deleted"
+     (message "GLMakie: Closed"))
+    (_
+     (message "GLMakie: Unprocessed event: %s" event))))
 
 (cl-defgeneric glmakie--process-message (msg &rest args)
   (message "GLMakie: Unrecognized message: %s (%s)" msg args))
@@ -101,9 +139,6 @@
   id
   file
   canvas)
-
-;; Key is string id, but id in canvas is symbol!
-(defvar glmakie--id->figure (make-hash-table :test #'equal))
 
 (defun glmakie-refresh (canvas)
   (glmakie--update canvas)
@@ -148,6 +183,19 @@
     (glmakie--send-init id height width)
     id))
 
+(defun glmakie--resize-delta (side how &optional px)
+  (assert (member side '(:height :width)))
+  (assert (member how '(:inc :dec)))
+  (if-let* ((canvas (image--get-image))
+            (px (or px current-prefix-arg 30))
+            (f (if (eq how :inc) #'+ #'-)))
+      (map-let (:id :data-height :data-width) (cdr canvas)
+        (glmakie--send-resize
+         (symbol-name id)
+         (max 1 (funcall f data-height (if (eq side :height) px 0)))
+         (max 1 (funcall f data-width (if (eq side :width) px 0)))))
+    (user-error "No canvas at point")))
+
 ;;;; Actions
 
 (defun glmakie-canvas-drag (e)
@@ -166,47 +214,51 @@
     (track-mouse
       (while tracking
         (let ((ev (read-event)))
-          (cond
-           ((eq (car-safe ev) 'mouse-movement)
-            (let* ((posn (event-end ev))
-                   (canvas-xy (posn-object-x-y posn))
-                   (img (posn-object posn)))
-              ;; TODO When mouse drags outside canvas bounds (img=nil) we can
-              ;; use "wh" to continue sending drag events
-              (when img
-                (message "Dragging on %s at X: %d, Y: %d" img (car canvas-xy) (cdr canvas-xy))
-                (glmakie--send-mouse-event
-                 "RIGHT" "DRAG"
-                 canvas-id
-                 (car canvas-xy) (cdr canvas-xy))
-              )))
-           
-           ((memq (car-safe ev) '(mouse-1 drag-mouse-1 up-mouse-1)) ; Drag ended
+          (if (eq (car-safe ev) 'mouse-movement)
+              (let* ((posn (event-end ev))
+                     (canvas-xy (posn-object-x-y posn))
+                     (img (posn-object posn)))
+                ;; TODO When mouse drags outside canvas bounds (img=nil) we can
+                ;; use "wh" to continue sending drag events
+                (when img
+                  (message "Dragging on %s at X: %d, Y: %d" img (car canvas-xy) (cdr canvas-xy))
+                  (glmakie--send-mouse-event
+                   "RIGHT" "DRAG"
+                   canvas-id
+                   (car canvas-xy) (cdr canvas-xy))
+                  ))
+            
             (setq tracking nil)
-            (let* ((posn (event-end ev))
+
+            (let* ((drag-end-p (memq (car-safe ev) '(mouse-1 drag-mouse-1 up-mouse-1)))
+                   (posn (event-end ev))
                    (canvas-xy (posn-object-x-y posn)))
               (glmakie--send-mouse-event
                "RIGHT" "RELEASE"
                canvas-id
-               (car canvas-xy) (cdr canvas-xy))))
-           
-           (t
-            (setq unread-command-events (cons ev unread-command-events))
-            (setq tracking nil))))))))
+               (car canvas-xy) (cdr canvas-xy))
+              
+              (unless drag-end-p
+                (setq unread-command-events (cons ev unread-command-events))))))))))
 
 (defvar-keymap glmakie-map
   "<down-mouse-1>" 'glmakie-canvas-drag
   "g" 'glmakie--send-reset
+  "<right>" (lambda () (interactive) (glmakie--resize-delta :width :inc))
+  "<left>" (lambda () (interactive) (glmakie--resize-delta :width :dec))
+  "<up>" (lambda () (interactive) (glmakie--resize-delta :height :dec))
+  "<down>" (lambda () (interactive) (glmakie--resize-delta :height :inc))
   )
 
 
 ;;;; Scratch
 
 (when nil
-  (progn
-    (glmakie-reload)
-    (glmakie-connect)
-    )
+  (glmakie--reload-module)
+
+  (glmakie-connect)
+
+  (glmakie-disconnect)
 
   (setq glmakie-canvas-id (glmakie-init 300 200))
   (setq glmakie-canvas-fig (gethash glmakie-canvas-id glmakie--id->figure))
@@ -214,15 +266,10 @@
 
   (clear-image-cache glmakie-canvas)
 
-  (glmakie--send-resize
-   glmakie-canvas-id
-   300 600
-   )
-
   (glmakie-refresh glmakie-canvas)
 
   (insert "\n" (propertize "#" 'display glmakie-canvas 'keymap glmakie-map))
-  #
+#
   )
 
 ;;;; Footer
