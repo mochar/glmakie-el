@@ -213,7 +213,13 @@ function start_server()
                         end
 
                         @info "Message: $line"
-                        Base.invokelatest(process_message, conn, line)
+
+                        try
+                            Base.invokelatest(process_message, conn, line)
+                        catch e
+                            # TODO Close buffer?
+                            @error e
+                        end
                     end
                 catch e
                     @error e

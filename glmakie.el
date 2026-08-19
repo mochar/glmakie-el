@@ -118,6 +118,11 @@
    glmakie--process
    (format "INIT %s %d %d\n" id height width)))
 
+(defun glmakie--send-close (id)
+  (process-send-string
+   glmakie--process
+   (format "CLOSE %s\n" id)))
+
 (defun glmakie--send-resize (id height width)
   (process-send-string
    glmakie--process
@@ -183,6 +188,35 @@
     (glmakie--send-init id height width)
     id))
 
+(defun glmakie--delete (canvas)
+  (let ((id (symbol-name (map-elt (cdr canvas) :id))))  
+    (image-flush glmakie-canvas t)
+    (glmakie--munmap)
+    (glmakie--send-close id)
+    (remhash id glmakie--id->figure)))
+
+(defun glmakie--canvas-modification-hook (start end)
+  (when (> end start)
+    (when-let ((img (image--get-image)))
+      (when (and (hash-table-contains-p
+                  (symbol-name (map-elt (cdr img) :id))
+                  glmakie--id->figure)
+                 (yes-or-no-p "Delete Makie plot?"))
+        (glmakie--delete img)))))
+
+(defun glmakie--insert (canvas &optional pos)
+  (let ((pos (or pos (point))))
+    (save-excursion
+      (move-end-of-line 1)
+      (insert
+       "\n"
+       (propertize
+        "#"
+        'display glmakie-canvas
+        'keymap glmakie-map
+        'modification-hooks (list #'glmakie--canvas-modification-hook)
+        )))))
+
 (defun glmakie--resize-delta (side how &optional px)
   (assert (member side '(:height :width)))
   (assert (member how '(:inc :dec)))
@@ -198,9 +232,10 @@
 
 ;;;; Actions
 
-(defun glmakie-canvas-drag (e)
+(defun glmakie--mouse-down-event (e)
   (interactive "e")
   (let* ((tracking t)
+         (btn (if (eq (car e) 'down-mouse-1) "LEFT" "RIGHT"))
          (posn (event-start e))
          (canvas-xy (posn-object-x-y posn))
          (canvas (posn-object posn))
@@ -208,7 +243,7 @@
          (canvas-id (map-elt canvas-props :id))
          (wh (posn-object-width-height posn)))
     (glmakie--send-mouse-event
-     "RIGHT" "PRESS"
+     btn "PRESS"
      canvas-id
      (car canvas-xy) (cdr canvas-xy))
     (track-mouse
@@ -223,7 +258,7 @@
                 (when img
                   (message "Dragging on %s at X: %d, Y: %d" img (car canvas-xy) (cdr canvas-xy))
                   (glmakie--send-mouse-event
-                   "RIGHT" "DRAG"
+                   btn "DRAG"
                    canvas-id
                    (car canvas-xy) (cdr canvas-xy))
                   ))
@@ -234,7 +269,7 @@
                    (posn (event-end ev))
                    (canvas-xy (posn-object-x-y posn)))
               (glmakie--send-mouse-event
-               "RIGHT" "RELEASE"
+               btn "RELEASE"
                canvas-id
                (car canvas-xy) (cdr canvas-xy))
               
@@ -242,7 +277,8 @@
                 (setq unread-command-events (cons ev unread-command-events))))))))))
 
 (defvar-keymap glmakie-map
-  "<down-mouse-1>" 'glmakie-canvas-drag
+  "<down-mouse-1>" 'glmakie--mouse-down-event
+  "<down-mouse-3>" 'glmakie--mouse-down-event
   "g" 'glmakie--send-reset
   "<right>" (lambda () (interactive) (glmakie--resize-delta :width :inc))
   "<left>" (lambda () (interactive) (glmakie--resize-delta :width :dec))
@@ -261,14 +297,14 @@
   (glmakie-disconnect)
 
   (setq glmakie-canvas-id (glmakie-init 300 200))
-  (setq glmakie-canvas-fig (gethash glmakie-canvas-id glmakie--id->figure))
-  (setq glmakie-canvas (oref glmakie-canvas-fig canvas))
+  (setq glmakie-canvas-fig (gethash glmakie-canvas-id glmakie--id->figure)
+        glmakie-canvas (oref glmakie-canvas-fig canvas))
 
   (clear-image-cache glmakie-canvas)
 
   (glmakie-refresh glmakie-canvas)
 
-  (insert "\n" (propertize "#" 'display glmakie-canvas 'keymap glmakie-map))
+  (glmakie--insert glmakie-canvas)
 #
   )
 

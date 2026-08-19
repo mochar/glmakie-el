@@ -1,24 +1,22 @@
 #include "emacs-module.h"
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 int plugin_is_GPL_compatible;
 
-static uint32_t* shared_buffer = MAP_FAILED;
+static uint32_t* shared_buffer = NULL;
 static size_t buffer_size = 0;
-
 
 /// Emacs utils
 
 static void message(emacs_env* env, const char* msg) {
   char logmsg[265];
-  strcpy(logmsg, "GLMakie(C): ");
-  strcat(logmsg, msg);
+  snprintf(logmsg, sizeof(logmsg), "GLMakie(C): %s", msg);
   emacs_value Qmessage = env->intern(env, "message");
   emacs_value Qstr = env->make_string(env, logmsg, strlen(logmsg));
   env->funcall(env, Qmessage, 1, (emacs_value[]){Qstr});
@@ -34,9 +32,11 @@ static void bind_function(emacs_env* env, const char* name, emacs_value Sfun) {
 /// Core functions
 
 static bool unmap_buffer() {
-  if (shared_buffer != MAP_FAILED) {
-    if (munmap(shared_buffer, buffer_size) != 0)
+  if (shared_buffer != NULL) {
+    int res = munmap(shared_buffer, buffer_size);
+    if (res != 0)
       return false;
+    shared_buffer = NULL;
     buffer_size = 0;
   }
   return true;
@@ -44,17 +44,21 @@ static bool unmap_buffer() {
 
 static int mmap_buffer(const char* path, size_t size) {
   // Unmap if already mapped
-  if (!unmap_buffer()) return 1;
-  
+  if (!unmap_buffer())
+    return 1;
+
   // Open and map the file
   int fd = open(path, O_RDONLY);
-  if (fd < 0) return 2;
+  if (fd < 0)
+    return 2;
 
   shared_buffer = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
   close(fd); // Safe to close fd after mmap
 
-  if (shared_buffer == MAP_FAILED)
+  if (shared_buffer == MAP_FAILED) {
+    shared_buffer = NULL;
     return 3;
+  }
 
   buffer_size = size;
   return 0;
@@ -69,8 +73,11 @@ static emacs_value Fmmap(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
                          void* data) {
   char path[256];
   ptrdiff_t path_len = sizeof(path);
-  env->copy_string_contents(env, args[0], path, &path_len);
-  
+  if (!env->copy_string_contents(env, args[0], path, &path_len)) {
+    message(env, "Error copying path contents");
+    return env->intern(env, "nil");
+  }
+
   size_t size = env->extract_integer(env, args[1]) * 4;
 
   int result = mmap_buffer(path, size);
@@ -93,24 +100,25 @@ static emacs_value Fmunmap(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
                            void* data) {
   if (unmap_buffer())
     return env->intern(env, "t");
-  
+
   message(env, "Error unmapping buffer");
   return env->intern(env, "nil");
 }
-
 
 /*
  * Lisp: (glmakie--update CANVAS)
  * Updates the canvas with the shared buffer data.
  */
-static emacs_value Fupdate(emacs_env *env, ptrdiff_t nargs, emacs_value args[], void *data) {
-  if (shared_buffer == MAP_FAILED) {
+static emacs_value Fupdate(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
+                           void* data) {
+  if (shared_buffer == NULL) {
     message(env, "Buffer unintialized");
     return env->intern(env, "nil");
   }
 
   emacs_value canvas = args[0];
-  uint32_t* canvas_buffer = env->is_not_nil(env, canvas) ? env->canvas_data(env, canvas) : 0;
+  uint32_t* canvas_buffer =
+      env->is_not_nil(env, canvas) ? env->canvas_data(env, canvas) : 0;
 
   if (canvas_buffer) {
     memcpy(canvas_buffer, shared_buffer, buffer_size);
@@ -121,14 +129,14 @@ static emacs_value Fupdate(emacs_env *env, ptrdiff_t nargs, emacs_value args[], 
 int emacs_module_init(struct emacs_runtime* rt) {
   emacs_env* env = rt->get_environment(rt);
 
-  emacs_value mmap_fun =
-      env->make_function(env, 2, 2, Fmmap, "Mmap the canvas shared memory file", NULL);
+  emacs_value mmap_fun = env->make_function(
+      env, 2, 2, Fmmap, "Mmap the canvas shared memory file", NULL);
   bind_function(env, "glmakie--mmap", mmap_fun);
-  
-  emacs_value munmap_fn =
-      env->make_function(env, 0, 0, Fmunmap, "Unmap the canvas shared memory buffer", NULL);
+
+  emacs_value munmap_fn = env->make_function(
+      env, 0, 0, Fmunmap, "Unmap the canvas shared memory buffer", NULL);
   bind_function(env, "glmakie--munmap", munmap_fn);
-  
+
   emacs_value update_fun =
       env->make_function(env, 1, 1, Fupdate, "Update CANVAS", NULL);
   bind_function(env, "glmakie--update", update_fun);
