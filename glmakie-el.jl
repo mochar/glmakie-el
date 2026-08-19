@@ -1,4 +1,4 @@
-using Mmap, GLMakie, Makie, Colors
+using Mmap, GLMakie, Makie, Colors, Match
 using FixedPointNumbers: N0f8
 
 
@@ -227,6 +227,26 @@ server_task = @async begin
                         resize!(canvas, h, w)
                         
                         println(conn, "RESIZE $id $h $w") 
+                    elseif parts[1] == "MOUSE"
+                        id = String(parts[4])
+                        x = parse(Float32, parts[5])
+                        y = parse(Float32, parts[6])
+                        
+                        canvas = canvases[(conn, id)]
+                        events = canvas.screen.scene.events
+
+                        events.mouseposition[] = (x, y)
+                        
+                        if parts[3] == "DRAG"
+                        else
+                            btn = parts[2] == "LEFT" ? Makie.Mouse.left : Makie.Mouse.right
+                            action = parts[3] == "PRESS" ? Makie.Mouse.press : Makie.Mouse.release
+                            events.mousebutton[] = Makie.MouseButtonEvent(btn, action)
+                        end
+
+                        GLMakie.render_frame(canvas.screen)
+                        sync!(canvas)
+                        println(conn, "REFRESH $id") 
                     elseif parts[1] == "CLOSE"
                         id = String(parts[2])
                         close!(pop!(canvases, (c, id)))
