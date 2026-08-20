@@ -39,8 +39,7 @@ Note that this does not unload the previous loaded objects."
     (copy-file "glmakie_el.so" tmp t)
     (module-load tmp)))
 
-;;;; Data structure
-
+;;;; Figure
 
 (cl-defstruct glmakie-figure
   ;; String identifier.
@@ -56,6 +55,21 @@ Note that this does not unload the previous loaded objects."
   ;; Emacs C pointer container for the C module to work with the buffer.
   buf-ptr
   )
+
+(defun glmakie--make-figure (&optional size)
+  (let* ((id (concat "glmakie-el-" (org-id-uuid)))
+         (id-sym (intern id)) ; `eq' used to identify canvases so must be symbol
+         (size (or size '(300 . 300)))
+         (canvas `(image
+                   :type canvas
+                   :id ,id-sym
+                   :data-width ,(car size)
+                   :data-height ,(cdr size)))
+         (file (concat "/dev/shm/" id ".bin" ))
+         (fig (make-glmakie-figure
+               :id id :file file :canvas canvas)))
+    (puthash id fig glmakie--id->figure)
+    fig))
 
 (defun glmakie--figure-resolve (fig/canvas/id)
   "Return FIG/CANVAS/ID as `glmakie-figure' object. Can be ID (string/symbol), canvas
@@ -75,8 +89,8 @@ object, or the figure itself."
 
 (defun glmakie-figure-at-point ()
   "Return `glmakie-figure' of the glmakie canvas image at point."
-  (when-let ((img (image--get-image)))
-    (glmakie--figure-resolve img)))
+  (when (image-at-point-p)
+    (glmakie--figure-resolve (image--get-image))))
 
 (defun glmakie-refresh (fig/canvas/id)
   "Read the color buffer from the mmaped file and refresh the canvas."
@@ -122,8 +136,9 @@ this from happening."
                 (pos (marker-position marker)))
       (when (buffer-live-p buf)
         (with-current-buffer buf
-          (when-let ((img (image--get-image pos)))
-            (when (eq img canvas)
+          (save-excursion
+            (goto-char pos)
+            (when (glmakie-figure-at-point)
               (delete-region pos (1+ pos)))))))
     ;; Delete
     (image-flush canvas t)
@@ -139,6 +154,42 @@ this from happening."
       (glmakie--delete-figure fig))
     ;; why not
     (clrhash glmakie--id->figure)))
+
+(defun glmakie--capture-julia-code (&optional initial-code)
+  "Popup a julia-mode buffer and return its contents."
+  (let* ((buf (generate-new-buffer "*glmakie-capture*"))
+         (original-window-config (current-window-configuration))
+         result)
+    
+    (with-current-buffer buf
+      (julia-ts-mode)
+      ;; TODO Getting some problems with julia-snail mode
+      (when (bound-and-true-p julia-snail-mode)
+        (julia-snail-mode -1))
+      (if initial-code
+          (insert initial-code)
+        (insert "lines(sin.(1:100))"))
+      
+      (local-set-key (kbd "C-c C-c") #'exit-recursive-edit)
+      (local-set-key (kbd "C-c C-k") #'abort-recursive-edit)
+      (setq header-line-format 
+            (propertize " Press C-c C-c to finish, C-c C-k to cancel. " 'face 'highlight)))
+
+    (pop-to-buffer buf)
+
+    ;; Enter recursive edit to block execution and wait for the user
+    (condition-case nil
+        (progn
+          (recursive-edit)
+          ;; User pressed C-c C-c
+          (setq result (with-current-buffer buf (buffer-string))))
+      ;; User pressed C-c C-k 
+      (quit (setq result nil)))
+
+    ;; Cleanup
+    (kill-buffer buf)
+    (set-window-configuration original-window-config)
+    result))
 
 ;;;; Server
 
@@ -244,22 +295,18 @@ This actually just sends a control-left click event."
 
 (cl-defmethod glmakie--process-message ((msg (eql 'INIT)) id height-str width-str)
   "Create a `glmakie-figure' and stores it in `glmakie--id->figure'."
-  (let* ((height (string-to-number height-str))
-         (width (string-to-number width-str))
-         (id-sym (intern id)) ; `eq' used to identify canvases so must be symbol
-         (canvas `(image
-                   :type canvas
-                   :id ,id-sym
-                   :data-width ,width
-                   :data-height ,height))
-         (file (concat "/dev/shm/" id ".bin" )))
-    (if-let* ((buf-ptr (glmakie--init file (* height width)))
-              (fig (make-glmakie-figure
-                    :id id :file file :canvas canvas :buf-ptr buf-ptr)))
-        (progn
-          (puthash id fig glmakie--id->figure)
-          (glmakie-refresh fig))
-      (warn "GLMakie: Mmap failed"))))
+  (if-let* ((fig (gethash id glmakie--id->figure))
+            (canvas (glmakie-figure-canvas fig))
+            (height (string-to-number height-str))
+            (width (string-to-number width-str)))
+      (if-let* ((buf-ptr (glmakie--init (glmakie-figure-file fig) (* height width))))
+          (progn
+            (setf (plist-get (cdr canvas) :data-height) height
+                  (plist-get (cdr canvas) :data-width) width
+                  (glmakie-figure-buf-ptr fig) buf-ptr)
+            (glmakie-refresh fig))
+        (warn "GLMakie: Mmap failed"))
+    (warn "GLMakie: Figure created but not found in emacs")))
 
 (cl-defmethod glmakie--process-message ((msg (eql 'RESIZE)) id height-str width-str)
   (when-let* ((height (string-to-number height-str))
@@ -278,27 +325,25 @@ This actually just sends a control-left click event."
   (when-let* ((figure (gethash id glmakie--id->figure)))
     (glmakie-refresh figure)))
 
-(defun glmakie-init (height width)
-  (let* ((id (concat "glmakie-el-" (org-id-uuid))))
-    (glmakie--send-init id height width)
-    id))
-
 (defun glmakie--canvas-modification-hook (start end)
   "Hook run when character holding canvas is deleted, ask user to delete figure."
   (when (> end start)
     (when-let ((fig (glmakie-figure-at-point)))
       (when (yes-or-no-p "Delete Makie plot?")
-        (glmakie--delete-figure img)))))
+        (let ((inhibit-modification-hooks t))
+        (glmakie--delete-figure fig))))))
 
-(defun glmakie--insert (canvas &optional pos)
-  (let ((pos (or pos (point))))
-    (save-excursion
+(defun glmakie--insert-canvas (canvas &optional pos)
+  (save-excursion
+    (if pos
+        (goto-char pos)
       (move-end-of-line 1)
+      (insert "\n"))
+    (prog1 (point-marker)
       (insert
-       "\n"
        (propertize
         "#"
-        'display glmakie-canvas
+        'display canvas
         'keymap glmakie-map
         'modification-hooks (list #'glmakie--canvas-modification-hook)
         )))))
@@ -387,10 +432,18 @@ This actually just sends a control-left click event."
 
 ;;;; Commands
 
-(defun glmakie-new-figure ()
+(defun glmakie-insert-new-figure ()
   (interactive)
-  )
-
+  (let* ((code (if (region-active-p)
+                   (buffer-substring-no-properties (region-beginning) (region-end))
+                 (glmakie--capture-julia-code)))
+         (fig (glmakie--make-figure))
+         (canvas (glmakie-figure-canvas fig))
+         (marker (glmakie--insert-canvas canvas)))
+    (setf (glmakie-figure-marker fig) marker)
+    (glmakie--send-init (glmakie-figure-id fig)
+                        (plist-get (cdr canvas) :data-height)
+                        (plist-get (cdr canvas) :data-width))))
 
 ;;;; Scratch
 
@@ -401,17 +454,7 @@ This actually just sends a control-left click event."
 
   (glmakie-disconnect)
 
-  (glmakie--cleanup)
-
-  (setq glmakie-canvas-id (glmakie-init 300 200))
-  (setq glmakie-canvas-fig (gethash glmakie-canvas-id glmakie--id->figure)
-        glmakie-canvas (oref glmakie-canvas-fig canvas))
-
-  (clear-image-cache glmakie-canvas)
-
-  (glmakie-refresh glmakie-canvas)
-
-  (glmakie--insert glmakie-canvas)
+  (glmakie-insert-new-figure)
 #
   )
 
