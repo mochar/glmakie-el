@@ -9,11 +9,11 @@
 
 int plugin_is_GPL_compatible;
 
-static uint32_t* shared_buffer = NULL;
-static size_t buffer_size = 0;
-
 /// Emacs utils
 
+/*
+ * Display a message in the message buffer.
+ */
 static void message(emacs_env* env, const char* msg) {
   char logmsg[265];
   snprintf(logmsg, sizeof(logmsg), "GLMakie(C): %s", msg);
@@ -22,6 +22,9 @@ static void message(emacs_env* env, const char* msg) {
   env->funcall(env, Qmessage, 1, (emacs_value[]){Qstr});
 }
 
+/*
+ * Bind a function to an emacs symbol.
+ */
 static void bind_function(emacs_env* env, const char* name, emacs_value Sfun) {
   emacs_value Qsym = env->intern(env, name);
   emacs_value Qfset = env->intern(env, "fset");
@@ -29,47 +32,75 @@ static void bind_function(emacs_env* env, const char* name, emacs_value Sfun) {
   env->funcall(env, Qfset, 2, fset_args);
 }
 
-/// Core functions
+/// Canvas buffer
 
-static bool unmap_buffer() {
-  if (shared_buffer != NULL) {
-    int res = munmap(shared_buffer, buffer_size);
-    if (res != 0)
-      return false;
-    shared_buffer = NULL;
-    buffer_size = 0;
-  }
-  return true;
+/*
+ * Holds pointer and size to mmaped color buffer of a GLMakie plot.
+ *  
+ * This struct is stored on the heap, and a pointer to it is passed to Emacs in
+ * a special "user_ptr" object. This object contains a finalizer that is called
+ * when the elisp object is garbage collected. See 'finalize_canvas_buffer'.
+ */
+typedef struct {
+  uint32_t* data;
+  size_t size;
+  char* filepath;
+} CanvasBuffer;
+
+/*
+ * Unmaps the mmaped buffer and deallocates the filepath field.
+ */
+static void free_canvas_buffer(CanvasBuffer* buf) {
+  if (buf->data == NULL || buf->size == 0)
+    return;
+  munmap(buf->data, buf->size);
+  if (buf->filepath != NULL)
+    free(buf->filepath);
+  free(buf);
 }
 
-static int mmap_buffer(const char* path, size_t size) {
-  // Unmap if already mapped
-  if (!unmap_buffer())
-    return 1;
+/*
+ * Finalizer passed to emacs CanvasBuffer ptr object that gets called when it
+ * gets garbage collected.
+  */
+static void finalize_canvas_buffer(void* buf_ptr) {
+  if (buf_ptr == NULL)
+    return;
+  CanvasBuffer* buf = (CanvasBuffer*)buf_ptr;
+  free_canvas_buffer(buf);
+}
 
+/*
+ * Mmap the file path with the given size, returns its pointer on success or
+ * NULL on failure.
+ */
+static uint32_t* mmap_buf(emacs_env* env, char* path, size_t size) {
   // Open and map the file
   int fd = open(path, O_RDONLY);
-  if (fd < 0)
-    return 2;
-
-  shared_buffer = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-  close(fd); // Safe to close fd after mmap
-
-  if (shared_buffer == MAP_FAILED) {
-    shared_buffer = NULL;
-    return 3;
+  if (fd < 0) {
+    message(env, "Failed to open file");
+    return NULL;
   }
 
-  buffer_size = size;
-  return 0;
+  // Mmap. We can safely close the fd afterwards
+  uint32_t* buf_data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);
+
+  if (buf_data == MAP_FAILED) {
+    message(env, "MMap failed");
+    return NULL;
+  }
+
+  return buf_data;
 }
 
 /// Emacs functions
 
 /*
- * Lisp: (glmakie--mmap SHM-PATH SIZE)
+ * Lisp: (glmakie--init SHM-PATH SIZE)
+ * Mmap and return elisp pointer structure to CanvasBuffer struct.
  */
-static emacs_value Fmmap(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
+static emacs_value Finit(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
                          void* data) {
   char path[256];
   ptrdiff_t path_len = sizeof(path);
@@ -80,66 +111,100 @@ static emacs_value Fmmap(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
 
   size_t size = env->extract_integer(env, args[1]) * 4;
 
-  int result = mmap_buffer(path, size);
-  if (result == 0)
-    return env->intern(env, "t");
-  if (result == 1) {
-    message(env, "Error unmapping buffer");
-  } else if (result == 2) {
-    message(env, "Failed to open file");
-  } else if (result == 3) {
-    message(env, "MMap failed");
-  }
-  return env->intern(env, "nil");
+  uint32_t* buf_data = mmap_buf(env, path, size);
+  if (buf_data == NULL)
+    return env->intern(env, "nil");
+
+  // Store buf ptr in struct with size so we can unmap it later
+  CanvasBuffer* buf = malloc(sizeof(CanvasBuffer));
+  buf->data = buf_data;
+  buf->size = size;
+  buf->filepath = malloc(path_len);
+  strcpy(buf->filepath, path);
+
+  // Make emacs hold it for me :) W emacs
+  return env->make_user_ptr(env, finalize_canvas_buffer, buf);
 }
 
 /*
- * Lisp: (glmakie--munmap)
+ * Lisp: (glmakie--resize BUF-PTR SIZE)
+ * Remap the shared buffer to a different size.
  */
-static emacs_value Fmunmap(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
+static emacs_value Fresize(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
                            void* data) {
-  if (unmap_buffer())
-    return env->intern(env, "t");
-
-  message(env, "Error unmapping buffer");
-  return env->intern(env, "nil");
-}
-
-/*
- * Lisp: (glmakie--update CANVAS)
- * Updates the canvas with the shared buffer data.
- */
-static emacs_value Fupdate(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
-                           void* data) {
-  if (shared_buffer == NULL) {
-    message(env, "Buffer unintialized");
+  CanvasBuffer* data_buf = (CanvasBuffer*)env->get_user_ptr(env, args[0]);
+  if (data_buf == NULL) {
+    message(env, "Buffer pointer is NULL");
     return env->intern(env, "nil");
   }
 
-  emacs_value canvas = args[0];
-  uint32_t* canvas_buffer =
+  //  First munmap
+  if (data_buf->data != NULL && data_buf->size > 0) {
+    if (munmap(data_buf->data, data_buf->size) != 0) {
+      message(env, "Munmap failed");
+      return env->intern(env, "nil");
+    }
+    data_buf->data = NULL;
+    data_buf->size = 0;
+  }
+
+  // Mmap again
+  size_t new_size = env->extract_integer(env, args[1]) * 4;
+  data_buf->data = mmap_buf(env, data_buf->filepath, new_size);
+  if (data_buf->data == NULL) {
+    message(env, "Freeing buffer data");
+    free_canvas_buffer(data_buf);
+    return env->intern(env, "nil");
+  }
+  data_buf->size = new_size;
+
+  return env->intern(env, "t");
+}
+
+/*
+ * Lisp: (glmakie--read BUF-PTR CANVAS)
+ * Updates the canvas with the shared buffer data.
+ */
+static emacs_value Fread(emacs_env* env, ptrdiff_t nargs, emacs_value args[],
+                         void* data) {
+  CanvasBuffer* data_buf = (CanvasBuffer*)env->get_user_ptr(env, args[0]);
+  if (data_buf == NULL) {
+    message(env, "Buffer pointer is NULL");
+    return env->intern(env, "nil");
+  }
+  if (data_buf->data == NULL) {
+    message(env, "Buffer is NULL");
+    return env->intern(env, "nil");
+  }
+
+  emacs_value canvas = args[1];
+  uint32_t* canvas_buf =
       env->is_not_nil(env, canvas) ? env->canvas_data(env, canvas) : 0;
 
-  if (canvas_buffer) {
-    memcpy(canvas_buffer, shared_buffer, buffer_size);
+  if (canvas_buf) {
+    memcpy(canvas_buf, data_buf->data, data_buf->size);
   }
   return env->intern(env, "t");
 }
 
+/// Module init
+
 int emacs_module_init(struct emacs_runtime* rt) {
   emacs_env* env = rt->get_environment(rt);
 
-  emacs_value mmap_fun = env->make_function(
-      env, 2, 2, Fmmap, "Mmap the canvas shared memory file", NULL);
-  bind_function(env, "glmakie--mmap", mmap_fun);
+  emacs_value init_fun = env->make_function(
+      env, 2, 2, Finit,
+      "Mmap the canvas shared memory file and return its pointer", NULL);
+  bind_function(env, "glmakie--init", init_fun);
 
-  emacs_value munmap_fn = env->make_function(
-      env, 0, 0, Fmunmap, "Unmap the canvas shared memory buffer", NULL);
-  bind_function(env, "glmakie--munmap", munmap_fn);
+  emacs_value resize_fun =
+      env->make_function(env, 2, 2, Fresize, "Resize the mmaped region", NULL);
+  bind_function(env, "glmakie--resize", resize_fun);
 
-  emacs_value update_fun =
-      env->make_function(env, 1, 1, Fupdate, "Update CANVAS", NULL);
-  bind_function(env, "glmakie--update", update_fun);
+  emacs_value read_fun = env->make_function(
+      env, 2, 2, Fread,
+      "Update CANVAS by reading from the shared memory buffer", NULL);
+  bind_function(env, "glmakie--read", read_fun);
 
   return 0;
 }

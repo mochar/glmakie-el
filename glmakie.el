@@ -33,14 +33,64 @@
 ;;;; Module
 
 (defun glmakie--reload-module ()
+  "Hack that copies the so file to a unique name and loads that as a module.
+Note that this does not unload the previous loaded objects."
   (let ((tmp (make-temp-file "glmakie_el_" nil ".so")))
     (copy-file "glmakie_el.so" tmp t)
     (module-load tmp)))
 
+;;;; Data structure
+
+
+(cl-defstruct glmakie-figure
+  ;; String identifier.
+  id
+  ;; Marker to charachter position in which canvas is displayed.
+  marker
+  ;; Path to the shared memory file that is used for mmap buffer.
+  file
+  ;; Image object specification used by emacs to config and identify the canvas.
+  ;; Emacs identifies images uniquely through this spec (with ‘eq’). For this
+  ;; reason the :id property in the canvas object is a symbol.
+  canvas
+  ;; Emacs C pointer container for the C module to work with the buffer.
+  buf-ptr
+  )
+
+(defun glmakie--figure-resolve (fig/canvas/id)
+  "Return FIG/CANVAS/ID as `glmakie-figure' object. Can be ID (string/symbol), canvas
+object, or the figure itself."
+  (cond
+   ((glmakie-figure-p fig/canvas/id)
+    fig/canvas/id)
+   ((symbolp fig/canvas/id)
+    (gethash (symbol-name fig/canvas/id) glmakie--id->figure))
+   ((stringp fig/canvas/id)
+    (gethash fig/canvas/id glmakie--id->figure))
+   ((and (consp fig/canvas/id)
+         (eq (car fig/canvas/id) 'image)
+         (plistp (cdr fig/canvas/id)))
+    (when-let ((id (map-elt (cdr fig/canvas/id) :id)))
+      (gethash (symbol-name id) glmakie--id->figure)))))
+
+(defun glmakie-figure-at-point ()
+  "Return `glmakie-figure' of the glmakie canvas image at point."
+  (when-let ((img (image--get-image)))
+    (glmakie--figure-resolve img)))
+
+(defun glmakie-refresh (fig/canvas/id)
+  "Read the color buffer from the mmaped file and refresh the canvas."
+  (when-let* ((fig (glmakie--figure-resolve fig/canvas/id))
+              (buf-ptr (glmakie-figure-buf-ptr fig))
+              (canvas (glmakie-figure-canvas fig)))
+    (glmakie--read buf-ptr canvas)
+    (canvas-refresh canvas)))
+
 ;;;; Variables
 
 ;; Key is string id, but id in canvas is symbol!
-(defvar glmakie--id->figure (make-hash-table :test #'equal))
+(defvar glmakie--id->figure (make-hash-table :test #'equal)
+  "Maps canvas ID (string) to canvas object of all canvases.")
 
 ;; Server process
 (defvar glmakie--process nil)
@@ -50,26 +100,55 @@
 ;;;; Utilities
 
 (defun glmakie--server-live-p ()
+  "Return non-nil if the TCP server is live and running."
   (when-let ((process-buf (get-buffer glmakie--process-buf-name)))
     (and process-buf
          (buffer-live-p process-buf)
          (process-live-p glmakie--process))))
 
+(defun glmakie--delete-figure (fig/canvas/id)
+  "Delete the glmakie figure.
+
+Note that the shared memory buffer is unmapped and the C struct
+deallocated when the buf-ptr stored in the figure is garbage
+collected. Therefore global references made to this struct will prevent
+this from happening."
+  (let* ((fig (glmakie--figure-resolve fig/canvas/id))
+         (canvas (glmakie-figure-canvas fig))
+         (id (glmakie-figure-id fig)))
+    ;; Delete the char that holds the canvas
+    (when-let* ((marker (glmakie-figure-marker fig))
+                (buf (marker-buffer marker))
+                (pos (marker-position marker)))
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (when-let ((img (image--get-image pos)))
+            (when (eq img canvas)
+              (delete-region pos (1+ pos)))))))
+    ;; Delete
+    (image-flush canvas t)
+    (when (glmakie--server-live-p)
+      (glmakie--send-close id))
+    (remhash id glmakie--id->figure)))
+
 (defun glmakie--cleanup ()
-  (glmakie--munmap)
   (unless (hash-table-empty-p glmakie--id->figure)
-    ;; TODO  Clean up buf per fig once thats implemented
-    ;; (maphash
-    ;;  (lambda (id fig)
-       
-    ;;    )
-    ;;  glmakie--id->figure
-    ;;  )
+    ;; glmakie--delete-figure removes it from the hashtable so not sure if its
+    ;; safe to use maphash. instead get keys first and loop.
+    (dolist (fig (hash-table-values glmakie--id->figure))
+      (glmakie--delete-figure fig))
+    ;; why not
     (clrhash glmakie--id->figure)))
 
 ;;;; Server
 
+;; A connection is established to a TCP server run in Julia to instruct it to
+;; make, update, and send events to GLMakie figures. Whenever such a request has
+;; been handled, Julia will send a message back telling us what happened to the
+;; figure and that the colorbuffer must be reread to update the figure.
+
 (defun glmakie-connect ()
+  "Create a TCP network stream to the Julia server."
   (if (glmakie--server-live-p)
       (message "Already connected")
     (setq glmakie--process
@@ -82,6 +161,9 @@
     (set-process-sentinel glmakie--process #'glmakie--server-process-sentinel)))
 
 (defun glmakie-disconnect ()
+  "Disconnect the Julia TCP stream.
+This also deletes all figures that have been made, as Julia will do so
+too when the connection is lost."
   (glmakie--cleanup)
   (when (process-live-p glmakie--process)
     (delete-process glmakie--process))
@@ -99,6 +181,8 @@
     (_
      (message "GLMakie: Unprocessed event: %s" event))))
 
+;; Julia messages start with a command. We dispatch `glmakie--process-message'
+;; methods on the interned command string.
 (cl-defgeneric glmakie--process-message (msg &rest args)
   (message "GLMakie: Unrecognized message: %s (%s)" msg args))
 
@@ -114,56 +198,52 @@
             (apply 'glmakie--process-message (intern (car parts)) (cdr parts))))))))
 
 (defun glmakie--send-cmd (cmd)
+  "Send CMD string to Julia."
   (when (glmakie--server-live-p)
     (process-send-string
      glmakie--process
      (concat cmd "\n"))))
 
 (defun glmakie--send-init (id height width)
+  "Tell Julia to make a new GLMakie figure."
   (glmakie--send-cmd
    (format "INIT %s %d %d" id height width)))
 
 (defun glmakie--send-close (id)
+  "Tell Julia to close and cleanup a figure."
   (glmakie--send-cmd
    (format "CLOSE %s" id)))
 
 (defun glmakie--send-resize (id height width)
+  "Tell Julia to resize a figure."
   (glmakie--send-cmd
    (format "RESIZE %s %d %d" id height width)))
 
 (defun glmakie--send-mouse-event (btn action id x y)
+  "Send a mouse event."
   (assert (member btn '("LEFT" "RIGHT")))
   (assert (member action '("PRESS" "RELEASE" "DRAG")))
   (glmakie--send-cmd
    (format "MOUSE %s %s %s %d %d" btn action id x y)))
 
 (defun glmakie--send-key-event (btn action id)
+  "Send a keyboard event."
   (assert (member action '("PRESS" "RELEASE" "REPEAT")))
   (glmakie--send-cmd
    (format "KEY %s %s %s" btn action id)))
 
-(defun glmakie--send-reset (id)
+(defun glmakie--send-reset-limits (id)
+  "Tell julia to reset the limits of a figure.
+This actually just sends a control-left click event."
   (glmakie--send-key-event "LEFT_CONTROL" "PRESS" id)
   (glmakie--send-mouse-event "LEFT" "PRESS" id 150 150)
   (glmakie--send-mouse-event "LEFT" "RELEASE" id 150 150)
-  (glmakie--send-key-event "LEFT_CONTROL" "RELEASE" id)
-  )
+  (glmakie--send-key-event "LEFT_CONTROL" "RELEASE" id))
 
 ;;;; Canvas
 
-;; The image specification object uniquely (with respect to ‘eq’) identifies a
-;; canvas image object.
-
-(cl-defstruct glmakie-figure
-  id
-  file
-  canvas)
-
-(defun glmakie-refresh (canvas)
-  (glmakie--update canvas)
-  (canvas-refresh canvas))
-
 (cl-defmethod glmakie--process-message ((msg (eql 'INIT)) id height-str width-str)
+  "Create a `glmakie-figure' and stores it in `glmakie--id->figure'."
   (let* ((height (string-to-number height-str))
          (width (string-to-number width-str))
          (id-sym (intern id)) ; `eq' used to identify canvases so must be symbol
@@ -172,51 +252,43 @@
                    :id ,id-sym
                    :data-width ,width
                    :data-height ,height))
-         (file (concat "/dev/shm/" id ".bin" ))
-         (fig (make-glmakie-figure :id id :file file :canvas canvas)))
-    (if (glmakie--mmap file (* height width))
+         (file (concat "/dev/shm/" id ".bin" )))
+    (if-let* ((buf-ptr (glmakie--init file (* height width)))
+              (fig (make-glmakie-figure
+                    :id id :file file :canvas canvas :buf-ptr buf-ptr)))
         (progn
           (puthash id fig glmakie--id->figure)
-          (glmakie-refresh canvas))
-      (message "GLMakie: Mmap failed"))))
+          (glmakie-refresh fig))
+      (warn "GLMakie: Mmap failed"))))
 
 (cl-defmethod glmakie--process-message ((msg (eql 'RESIZE)) id height-str width-str)
   (when-let* ((height (string-to-number height-str))
               (width (string-to-number width-str))
               (figure (gethash id glmakie--id->figure))
-              (canvas (oref figure canvas)))
+              (buf-ptr (glmakie-figure-buf-ptr figure))
+              (canvas (glmakie-figure-canvas figure)))
     (setf (plist-get (cdr canvas) :data-height) height
           (plist-get (cdr canvas) :data-width) width)
     (clear-image-cache canvas) ; TODO Necessary?
-    (if (glmakie--mmap (oref figure file) (* height width))
-        (glmakie-refresh canvas)
+    (if (glmakie--resize buf-ptr (* height width))
+        (glmakie-refresh figure)
       (message "GLMakie: Mmap failed"))))
 
 (cl-defmethod glmakie--process-message ((msg (eql 'REFRESH)) id)
-  (when-let* ((figure (gethash id glmakie--id->figure))
-              (canvas (oref figure canvas)))
-    (glmakie-refresh canvas)))
-    
+  (when-let* ((figure (gethash id glmakie--id->figure)))
+    (glmakie-refresh figure)))
+
 (defun glmakie-init (height width)
   (let* ((id (concat "glmakie-el-" (org-id-uuid))))
     (glmakie--send-init id height width)
     id))
 
-(defun glmakie--delete (canvas)
-  (let ((id (symbol-name (map-elt (cdr canvas) :id))))  
-    (image-flush glmakie-canvas t)
-    (glmakie--munmap)
-    (glmakie--send-close id)
-    (remhash id glmakie--id->figure)))
-
 (defun glmakie--canvas-modification-hook (start end)
+  "Hook run when character holding canvas is deleted, ask user to delete figure."
   (when (> end start)
-    (when-let ((img (image--get-image)))
-      (when (and (hash-table-contains-p
-                  (symbol-name (map-elt (cdr img) :id))
-                  glmakie--id->figure)
-                 (yes-or-no-p "Delete Makie plot?"))
-        (glmakie--delete img)))))
+    (when-let ((fig (glmakie-figure-at-point)))
+      (when (yes-or-no-p "Delete Makie plot?")
+        (glmakie--delete-figure img)))))
 
 (defun glmakie--insert (canvas &optional pos)
   (let ((pos (or pos (point))))
@@ -300,7 +372,7 @@
   (let* ((canvas (image--get-image))
          (canvas-props (cdr canvas))
          (canvas-id (map-elt canvas-props :id)))
-    (glmakie--send-reset canvas-id)))
+    (glmakie--send-reset-limits canvas-id)))
 
 (defvar-keymap glmakie-map
   "<down-mouse-1>" 'glmakie--mouse-down-event
@@ -313,6 +385,12 @@
   "<down>" (lambda () (interactive) (glmakie--resize-delta :height :inc))
   )
 
+;;;; Commands
+
+(defun glmakie-new-figure ()
+  (interactive)
+  )
+
 
 ;;;; Scratch
 
@@ -322,6 +400,8 @@
   (glmakie-connect)
 
   (glmakie-disconnect)
+
+  (glmakie--cleanup)
 
   (setq glmakie-canvas-id (glmakie-init 300 200))
   (setq glmakie-canvas-fig (gethash glmakie-canvas-id glmakie--id->figure)
