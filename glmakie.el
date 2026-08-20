@@ -344,7 +344,7 @@ This actually just sends a control-left click event."
     (prog1 (point-marker)
       (insert
        (propertize
-        comment-start
+        (or comment-start "#")
         'display canvas
         'keymap glmakie-map
         'modification-hooks (list #'glmakie--canvas-modification-hook)
@@ -446,6 +446,22 @@ This actually just sends a control-left click event."
     (glmakie--send-init (glmakie-figure-id fig)
                         (plist-get (cdr canvas) :data-height)
                         (plist-get (cdr canvas) :data-width))))
+
+(defun glmakie-figures ()
+  "View all figures in a buffer."
+  (interactive)
+  (let ((buf (get-buffer-create "*glmakie figures*")))
+    (with-current-buffer buf
+      (delete-region (point-min) (point-max))
+      (goto-char (point-min))
+      (if (hash-table-empty-p glmakie--id->figure)
+          (insert (propertize "No figures" 'face 'Info-quoted))
+        (dolist (fig (hash-table-values glmakie--id->figure))
+          (glmakie--insert-canvas (glmakie-figure-canvas fig) (point))
+          (move-end-of-line 1)
+          (insert "\n"))
+        (goto-char (point-min))))
+    (pop-to-buffer buf)))
 
 ;;;; Scratch
 
