@@ -59,7 +59,7 @@ Note that this does not unload the previous loaded objects."
 (defun glmakie--make-figure (&optional size)
   (let* ((id (concat "glmakie-el-" (org-id-uuid)))
          (id-sym (intern id)) ; `eq' used to identify canvases so must be symbol
-         (size (or size '(300 . 300)))
+         (size (or size glmakie-default-size))
          (canvas `(image
                    :type canvas
                    :id ,id-sym
@@ -111,6 +111,8 @@ object, or the figure itself."
 ;; Server process
 (defvar glmakie--process nil)
 (defvar glmakie--process-buf-name "*glmakie process*")
+
+(defvar glmakie-default-size '(750 . 400))
 
 (defvar glmakie-mouse-drag-ms (/ 1.0 60) ; 60 FPS
   "How frequently to send mouse drag events in milliseconds.")
@@ -170,9 +172,8 @@ this from happening."
       ;; TODO Getting some problems with julia-snail mode
       (when (bound-and-true-p julia-snail-mode)
         (julia-snail-mode -1))
-      (if initial-code
-          (insert initial-code)
-        (insert "lines(sin.(1:100))"))
+      (when initial-code
+          (insert initial-code))
       
       (local-set-key (kbd "C-c C-c") #'exit-recursive-edit)
       (local-set-key (kbd "C-c C-k") #'abort-recursive-edit)
@@ -260,10 +261,21 @@ too when the connection is lost."
      glmakie--process
      (concat cmd "\n"))))
 
-(defun glmakie--send-init (id height width)
+(defun glmakie--send-init (id height width &optional code)
   "Tell Julia to make a new GLMakie figure."
   (glmakie--send-cmd
-   (format "INIT %s %d %d" id height width)))
+   (format "INIT %s %d %d %s"
+           id height width
+           (json-encode-string
+            (format "begin %s end" (or code ""))))))
+
+(defun glmakie--send-eval (id code)
+  "Tell Julia to evaluate CODE with ID as current active figure."
+  (glmakie--send-cmd
+   (format "EVAL %s %s"
+           id
+           (json-encode-string
+            (format "begin %s end" (or code ""))))))
 
 (defun glmakie--send-close (id)
   "Tell Julia to close and cleanup a figure."
@@ -437,22 +449,34 @@ This actually just sends a control-left click event."
   "<left>" (lambda () (interactive) (glmakie--resize-delta :width :dec))
   "<up>" (lambda () (interactive) (glmakie--resize-delta :height :dec))
   "<down>" (lambda () (interactive) (glmakie--resize-delta :height :inc))
+  "<return>" 'glmakie-send
   )
 
 ;;;; Commands
 
-(defun glmakie-insert-new-figure ()
+(defun glmakie-insert ()
+  "Insert a new GLMakie figure at point."
   (interactive)
   (let* ((code (if (region-active-p)
                    (buffer-substring-no-properties (region-beginning) (region-end))
-                 (glmakie--capture-julia-code)))
+                 (glmakie--capture-julia-code
+                  "lines!(sin.(1:100))\nlines!(cos.(1:100))")))
          (fig (glmakie--make-figure))
          (canvas (glmakie-figure-canvas fig))
          (marker (glmakie--insert-canvas canvas)))
     (setf (glmakie-figure-marker fig) marker)
     (glmakie--send-init (glmakie-figure-id fig)
                         (plist-get (cdr canvas) :data-height)
-                        (plist-get (cdr canvas) :data-width))))
+                        (plist-get (cdr canvas) :data-width)
+                        code)))
+
+(defun glmakie-send ()
+  "Evaluate code with the figure at point as active figure."
+  (interactive)
+  (if-let* ((fig (glmakie-figure-at-point))
+            (code (glmakie--capture-julia-code)))
+      (glmakie--send-eval (glmakie-figure-id fig) code)
+    (user-error "No GLMakie figure at point")))
 
 (defun glmakie-figures ()
   "View all figures in a buffer."
@@ -479,7 +503,8 @@ This actually just sends a control-left click event."
 
   (glmakie-disconnect) 
 
-  (glmakie-insert-new-figure)
+  (glmakie-insert)
+
 
   )
 

@@ -125,6 +125,7 @@ mutable struct EmacsCanvas
     id::String
     path::String
     screen::GLMakie.Screen{EmacsWindow}
+    fig::GLMakie.Figure
     buffer::Matrix{RGBA{N0f8}}
 end
 
@@ -134,7 +135,12 @@ function sync!(canvas::EmacsCanvas)
     Mmap.sync!(canvas.buffer)
 end
 
-function init_canvas(id::String, height::Int, width::Int)::EmacsCanvas
+function render!(canvas::EmacsCanvas)
+    GLMakie.render_frame(canvas.screen)
+    sync!(canvas)
+end
+
+function init_canvas(id::String, height::Int, width::Int, code::Union{Expr, Nothing}=nothing)::EmacsCanvas
     shm_path = id_to_shm_path(id)
     io = open(shm_path, "w+")
     truncate(io, width * height * 4) # 4 bytes per pixel (RGBA)
@@ -144,12 +150,18 @@ function init_canvas(id::String, height::Int, width::Int)::EmacsCanvas
     screen = GLMakie.Screen(; window=window, start_renderloop=false)
     # Base.resize!(screen, width, height) # Force the screen out of 10x10 fallback
     
-    f = Figure(size=(width, height))
-    lines(f[1,1], sin.(1:100))
+    fig = Figure(size=(width, height))
+    ax = Axis(fig[1, 1])
+    current_figure!(fig)
+    current_axis!(ax)
+    if code !== nothing
+        @info "Code:" code
+        eval(code)
+    end
     GLMakie.render_frame(screen)
-    display(screen, f)
+    display(screen, fig)
 
-    canvas = EmacsCanvas(id, shm_path, screen, shared_buf)
+    canvas = EmacsCanvas(id, shm_path, screen, fig, shared_buf)
     sync!(canvas)
     canvas
 end
@@ -216,14 +228,15 @@ function start_server()
                         @info "Message: $line"
 
                         try
+                            # TODO Don't invokelatest?
                             Base.invokelatest(process_message, conn, line)
                         catch e
                             # TODO Close buffer?
-                            @error e
+                            @error "Error processing message" exception=(e, stacktrace(catch_backtrace()))
                         end
                     end
                 catch e
-                    @error e
+                    @error "Error handling connection" exception=(e, stacktrace(catch_backtrace()))
                 finally
                     close(conn)
                     for (c, id) in keys(canvases)
@@ -258,21 +271,32 @@ function stop_server()
 end
 
 function process_message(conn::TCPSocket, message::AbstractString)
-    parts = split(message)
-    @match parts begin
-        ["INIT", id, h, w] => process_init(conn, id, h, w)
-        ["RESIZE", id, h, w] => process_resize(conn, id, h, w)
-        ["MOUSE", btn, action, id, x, y] => process_mouse(conn, btn, action, id, x, y)
-        ["KEY", btn, action, id] => process_key(conn, btn, action, id)
-        ["CLOSE", id] => close!(pop!(canvases, (conn, String(id))))
+    cmd, args = split(message; limit=2)
+    @match cmd begin
+        "INIT"   => process_init(conn, args)
+        "EVAL"   => process_eval(conn, args)
+        "RESIZE" => process_resize(conn, args)
+        "MOUSE"  => process_mouse(conn, args)
+        "KEY"    => process_key(conn, args)
+        "CLOSE"  => close!(pop!(canvases, (conn, String(args))))
     end
 end
 
-function process_init(conn, id, h, w)
+function parse_code_string(code)
+    @match code begin
+        ::Nothing | "" => nothing
+        _ => Meta.parse(Meta.parse(code)) # bruh
+    end
+end
+
+function process_init(conn, args)
+    id, h, w, code = split(args; limit=4)
+    
     id = String(id)
     h, w = parse.(Int, [h, w])
+    code = parse_code_string(code)
     
-    canvas = init_canvas(id, h, w)
+    canvas = init_canvas(id, h, w, code)
     if haskey(canvases, (conn, id))
         close!(pop!(canvases, (conn, id)))
     end
@@ -280,7 +304,26 @@ function process_init(conn, id, h, w)
     println(conn, "INIT $id $h $w")
 end
 
-function process_resize(conn, id, h, w)
+function process_eval(conn, args)
+    id, code = split(args; limit=2)
+    
+    id = String(id)
+    code = parse_code_string(code)
+    canvas = canvases[(conn, id)]
+
+    current_figure!(canvas.fig)
+    if code !== nothing 
+        eval(code)
+        autolimits!()
+    end
+
+    render!(canvas)
+    println(conn, "REFRESH $id")
+end
+
+function process_resize(conn, args)
+    id, h, w = split(args)
+    
     id = String(id)
     h, w = parse.(Int, [h, w])
     
@@ -289,7 +332,9 @@ function process_resize(conn, id, h, w)
     println(conn, "RESIZE $id $h $w") 
 end
 
-function process_mouse(conn, btn, action, id, x, y)
+function process_mouse(conn, args)
+    btn, action, id, x, y = split(args)
+    
     id = String(id)
     canvas = canvases[(conn, id)]
     window = canvas.screen.glscreen
@@ -306,12 +351,13 @@ function process_mouse(conn, btn, action, id, x, y)
         events.mousebutton[] = Makie.MouseButtonEvent(btn, action)
     end
 
-    GLMakie.render_frame(canvas.screen)
-    sync!(canvas)
+    render!(canvas)
     println(conn, "REFRESH $id") 
 end
 
-function process_key(conn, btn, action, id)
+function process_key(conn, args)
+    btn, action, id = split(args)
+    
     id = String(id)
     canvas = canvases[(conn, id)]
     window = canvas.screen.glscreen
@@ -326,8 +372,7 @@ function process_key(conn, btn, action, id)
     events = canvas.screen.scene.events
     events.keyboardbutton[] = Makie.KeyEvent(btn, action)
 
-    GLMakie.render_frame(canvas.screen)
-    sync!(canvas)
+    render!(canvas)
     println(conn, "REFRESH $id") 
 end
 
