@@ -1,0 +1,5 @@
+Interactive plotting in Emacs using Julia GLMakie.
+
+This uses the new canvas feature of Emacs 32.
+
+WIP
