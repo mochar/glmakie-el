@@ -112,6 +112,8 @@ object, or the figure itself."
 (defvar glmakie--process nil)
 (defvar glmakie--process-buf-name "*glmakie process*")
 
+(defvar glmakie-mouse-drag-ms (/ 1.0 60) ; 60 FPS
+  "How frequently to send mouse drag events in milliseconds.")
 
 ;;;; Utilities
 
@@ -184,7 +186,8 @@ this from happening."
         (progn
           (recursive-edit)
           ;; User pressed C-c C-c
-          (setq result (with-current-buffer buf (buffer-string))))
+          (setq result (with-current-buffer buf
+                         (buffer-substring-no-properties (point-min) (point-max)))))
       ;; User pressed C-c C-k 
       (quit (setq result nil)))
 
@@ -368,6 +371,7 @@ This actually just sends a control-left click event."
 (defun glmakie--mouse-down-event (e)
   (interactive "e")
   (let* ((tracking t)
+         (last-drag-time (float-time))
          (btn (if (eq (car e) 'down-mouse-1) "LEFT" "RIGHT"))
          (posn (event-start e))
          (canvas-xy (posn-object-x-y posn))
@@ -381,20 +385,23 @@ This actually just sends a control-left click event."
      (car canvas-xy) (cdr canvas-xy))
     (track-mouse
       (while tracking
-        (let ((ev (read-event)))
+        (let ((ev (read-event))
+              (now (float-time))) ; TODO Use posn-timestamp
           (if (eq (car-safe ev) 'mouse-movement)
-              (let* ((posn (event-end ev))
-                     (canvas-xy (posn-object-x-y posn))
-                     (img (posn-object posn)))
-                ;; TODO When mouse drags outside canvas bounds (img=nil) we can
-                ;; use "wh" to continue sending drag events
-                (when img
-                  (message "Dragging on %s at X: %d, Y: %d" img (car canvas-xy) (cdr canvas-xy))
-                  (glmakie--send-mouse-event
-                   btn "DRAG"
-                   canvas-id
-                   (car canvas-xy) (cdr canvas-xy))
-                  ))
+              (when (> (- now last-drag-time) glmakie-mouse-drag-ms)
+                (setq last-drag-time now)
+                (let* ((posn (event-end ev))
+                       (canvas-xy (posn-object-x-y posn))
+                       (img (posn-object posn)))
+                  ;; TODO When mouse drags outside canvas bounds (img=nil) we can
+                  ;; use "wh" to continue sending drag events
+                  (when img
+                    ;; (message "Dragging on %s at X: %d, Y: %d" img (car canvas-xy) (cdr canvas-xy))
+                    (glmakie--send-mouse-event
+                     btn "DRAG"
+                     canvas-id
+                     (car canvas-xy) (cdr canvas-xy))
+                    )))
             
             (setq tracking nil)
 
