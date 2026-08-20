@@ -87,10 +87,12 @@ object, or the figure itself."
     (when-let ((id (map-elt (cdr fig/canvas/id) :id)))
       (gethash (symbol-name id) glmakie--id->figure)))))
 
-(defun glmakie-figure-at-point ()
+(defun glmakie-figure-at-point (&optional id)
   "Return `glmakie-figure' of the glmakie canvas image at point."
   (when (image-at-point-p)
-    (glmakie--figure-resolve (image--get-image))))
+    (when-let ((fig (glmakie--figure-resolve (image--get-image))))
+      (when (or (null id) (string= id (glmakie-figure-id fig)))
+          fig))))
 
 (defun glmakie-refresh (fig/canvas/id)
   "Read the color buffer from the mmaped file and refresh the canvas."
@@ -138,7 +140,7 @@ this from happening."
         (with-current-buffer buf
           (save-excursion
             (goto-char pos)
-            (when (glmakie-figure-at-point)
+            (when-let ((fig (glmakie-figure-at-point id)))
               (delete-region pos (1+ pos)))))))
     ;; Delete
     (image-flush canvas t)
@@ -342,7 +344,7 @@ This actually just sends a control-left click event."
     (prog1 (point-marker)
       (insert
        (propertize
-        "#"
+        comment-start
         'display canvas
         'keymap glmakie-map
         'modification-hooks (list #'glmakie--canvas-modification-hook)
@@ -452,10 +454,10 @@ This actually just sends a control-left click event."
 
   (glmakie-connect)
 
-  (glmakie-disconnect)
+  (glmakie-disconnect) 
 
   (glmakie-insert-new-figure)
-#
+
   )
 
 ;;;; Footer
