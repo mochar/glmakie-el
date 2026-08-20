@@ -200,6 +200,7 @@ function start_server()
     server_task = @async begin
         while !server_stop_flag[]
             conn = accept(server)
+            @info "New connection: $conn"
             push!(conns, conn)
         
             @async begin
@@ -262,6 +263,7 @@ function process_message(conn::TCPSocket, message::AbstractString)
         ["INIT", id, h, w] => process_init(conn, id, h, w)
         ["RESIZE", id, h, w] => process_resize(conn, id, h, w)
         ["MOUSE", btn, action, id, x, y] => process_mouse(conn, btn, action, id, x, y)
+        ["KEY", btn, action, id] => process_key(conn, btn, action, id)
         ["CLOSE", id] => close!(pop!(canvases, (conn, String(id))))
     end
 end
@@ -303,6 +305,26 @@ function process_mouse(conn, btn, action, id, x, y)
         action = action == "PRESS" ? Makie.Mouse.press : Makie.Mouse.release
         events.mousebutton[] = Makie.MouseButtonEvent(btn, action)
     end
+
+    GLMakie.render_frame(canvas.screen)
+    sync!(canvas)
+    println(conn, "REFRESH $id") 
+end
+
+function process_key(conn, btn, action, id)
+    id = String(id)
+    canvas = canvases[(conn, id)]
+    window = canvas.screen.glscreen
+    
+    btn = @eval Makie.Keyboard.$(Symbol(lowercase(btn)))
+    action = @match action begin
+        "PRESS" => Makie.Keyboard.press
+        "RELEASE" => Makie.Keyboard.release
+        "REPEAT" => Makie.Keyboard.repeat
+    end
+                        
+    events = canvas.screen.scene.events
+    events.keyboardbutton[] = Makie.KeyEvent(btn, action)
 
     GLMakie.render_frame(canvas.screen)
     sync!(canvas)

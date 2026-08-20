@@ -113,27 +113,41 @@
           (let ((parts (s-split " " cmd)))
             (apply 'glmakie--process-message (intern (car parts)) (cdr parts))))))))
 
+(defun glmakie--send-cmd (cmd)
+  (when (glmakie--server-live-p)
+    (process-send-string
+     glmakie--process
+     (concat cmd "\n"))))
+
 (defun glmakie--send-init (id height width)
-  (process-send-string
-   glmakie--process
-   (format "INIT %s %d %d\n" id height width)))
+  (glmakie--send-cmd
+   (format "INIT %s %d %d" id height width)))
 
 (defun glmakie--send-close (id)
-  (process-send-string
-   glmakie--process
-   (format "CLOSE %s\n" id)))
+  (glmakie--send-cmd
+   (format "CLOSE %s" id)))
 
 (defun glmakie--send-resize (id height width)
-  (process-send-string
-   glmakie--process
-   (format "RESIZE %s %d %d\n" id height width)))
+  (glmakie--send-cmd
+   (format "RESIZE %s %d %d" id height width)))
 
 (defun glmakie--send-mouse-event (btn action id x y)
   (assert (member btn '("LEFT" "RIGHT")))
-  (assert (member action '("PRESS" "RELEASE"  "DRAG")))
-  (process-send-string
-   glmakie--process
-   (format "MOUSE %s %s %s %d %d\n" btn action id x y)))
+  (assert (member action '("PRESS" "RELEASE" "DRAG")))
+  (glmakie--send-cmd
+   (format "MOUSE %s %s %s %d %d" btn action id x y)))
+
+(defun glmakie--send-key-event (btn action id)
+  (assert (member action '("PRESS" "RELEASE" "REPEAT")))
+  (glmakie--send-cmd
+   (format "KEY %s %s %s" btn action id)))
+
+(defun glmakie--send-reset (id)
+  (glmakie--send-key-event "LEFT_CONTROL" "PRESS" id)
+  (glmakie--send-mouse-event "LEFT" "PRESS" id 150 150)
+  (glmakie--send-mouse-event "LEFT" "RELEASE" id 150 150)
+  (glmakie--send-key-event "LEFT_CONTROL" "RELEASE" id)
+  )
 
 ;;;; Canvas
 
@@ -276,10 +290,23 @@
               (unless drag-end-p
                 (setq unread-command-events (cons ev unread-command-events))))))))))
 
+(defun glmakie--keyboard-event ()
+  (interactive)
+  (let ((fig (glmakie-figure-at-point)))
+    (message "%s" fig)))
+
+(defun glmakie-reset-limits ()
+  (interactive)
+  (let* ((canvas (image--get-image))
+         (canvas-props (cdr canvas))
+         (canvas-id (map-elt canvas-props :id)))
+    (glmakie--send-reset canvas-id)))
+
 (defvar-keymap glmakie-map
   "<down-mouse-1>" 'glmakie--mouse-down-event
   "<down-mouse-3>" 'glmakie--mouse-down-event
-  "g" 'glmakie--send-reset
+  "l" 'glmakie-reset-limits
+  ;; "<t>" 'glmakie--keyboard-event
   "<right>" (lambda () (interactive) (glmakie--resize-delta :width :inc))
   "<left>" (lambda () (interactive) (glmakie--resize-delta :width :dec))
   "<up>" (lambda () (interactive) (glmakie--resize-delta :height :dec))
